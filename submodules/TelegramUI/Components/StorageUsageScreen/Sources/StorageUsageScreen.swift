@@ -732,6 +732,35 @@ final class StorageUsageScreenComponent: Component {
         private var currentSelectedPanelId: AnyHashable?
         
         private var clearingDisplayTimestamp: Double?
+        #if targetEnvironment(simulator)
+        private var duckDemoStartedAt: CFTimeInterval?
+        private var duckDemoDidFinish = false
+        private var duckDemoTimer: Foundation.Timer?
+
+        private func startDuckDemo() {
+            guard self.duckDemoStartedAt == nil, !self.isClearing else { return }
+            self.duckDemoStartedAt = CACurrentMediaTime()
+            self.state?.updated(transition: .immediate)
+            let timer = Foundation.Timer(timeInterval: 0.1, repeats: true) { [weak self] timer in
+                guard let self, let start = self.duckDemoStartedAt else {
+                    timer.invalidate()
+                    return
+                }
+                let progress = (CACurrentMediaTime() - start) / 12.0
+                if progress >= 1.0 {
+                    timer.invalidate()
+                    self.duckDemoTimer = nil
+                    self.duckDemoStartedAt = nil
+                    self.duckDemoDidFinish = true
+                    self.state?.updated(transition: ComponentTransition(animation: .none).withUserData(AnimationHint(value: .clearedItems)))
+                } else {
+                    self.updateClearProgress(progress: Float(progress))
+                }
+            }
+            self.duckDemoTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        #endif
         private var isClearing: Bool = false {
             didSet {
                 if self.isClearing != oldValue {
@@ -1381,6 +1410,11 @@ final class StorageUsageScreenComponent: Component {
                 }
             }
             
+            #if targetEnvironment(simulator)
+            if self.duckDemoDidFinish {
+                listCategories.removeAll()
+            }
+            #endif
             self.chartHasData = !listCategories.isEmpty
             listCategories.sort(by: { $0.size > $1.size })
             
@@ -2215,6 +2249,11 @@ final class StorageUsageScreenComponent: Component {
                 ))
             }
             
+            #if targetEnvironment(simulator)
+            if self.duckDemoDidFinish {
+                panelItems.removeAll()
+            }
+            #endif
             if !panelItems.isEmpty {
                 let panelContainerSize = self.panelContainer.update(
                     transition: transition,
@@ -2280,7 +2319,13 @@ final class StorageUsageScreenComponent: Component {
             
             self.updateScrolling(transition: transition)
             
-            if self.isClearing {
+            #if targetEnvironment(simulator)
+            let shouldShowClearingOverlay = self.isClearing || self.duckDemoStartedAt != nil
+            #else
+            let shouldShowClearingOverlay = self.isClearing
+            #endif
+
+            if shouldShowClearingOverlay {
                 let clearingNode: StorageUsageClearProgressOverlayNode
                 var animateIn = false
                 if let current = self.clearingNode {
@@ -2303,6 +2348,7 @@ final class StorageUsageScreenComponent: Component {
             } else {
                 if let clearingNode = self.clearingNode {
                     self.clearingNode = nil
+                    clearingNode.finishSweepGame()
                     
                     var delay: Double = 0.0
                     if let clearingDisplayTimestamp = self.clearingDisplayTimestamp {
@@ -2891,6 +2937,12 @@ final class StorageUsageScreenComponent: Component {
             guard let component = self.component, let aggregatedData = self.aggregatedData else {
                 return
             }
+            #if targetEnvironment(simulator)
+            if fromCategories, aggregatedData.peerId == nil {
+                self.startDuckDemo()
+                return
+            }
+            #endif
             let context = component.context
             let presentationData = context.sharedContext.currentPresentationData.with { $0 }
             
@@ -3571,6 +3623,8 @@ private class StorageUsageClearProgressOverlayNode: ASDisplayNode {
     
     private let blurredView: BlurredBackgroundView
     private let animationNode: AnimatedStickerNode
+    private let duckButton = UIButton(type: .custom)
+    private var sweepGame: CacheSweepGameView?
     private let progressText = ComponentView<Empty>()
     private let descriptionText = ComponentView<Empty>()
     private let progressBackgroundNode: ASDisplayNode
@@ -3602,7 +3656,61 @@ private class StorageUsageClearProgressOverlayNode: ASDisplayNode {
         self.view.addSubview(self.blurredView)
         self.addSubnode(self.animationNode)
         self.addSubnode(self.progressBackgroundNode)
-        self.addSubnode(self.progressForegroundNode)
+        self.progressBackgroundNode.addSubnode(self.progressForegroundNode)
+        self.duckButton.accessibilityLabel = "Play with the duck"
+        self.duckButton.addTarget(self, action: #selector(self.openSweepGame), for: .touchUpInside)
+        self.view.addSubview(self.duckButton)
+    }
+
+    @objc private func openSweepGame() {
+        guard self.sweepGame == nil, let (size, bottomInset) = self.validLayout else {
+            return
+        }
+
+        let oldProgressY = self.progressBackgroundNode.frame.minY
+        let originalCenter = self.animationNode.position
+        let game = CacheSweepGameView(frame: CGRect(origin: .zero, size: size))
+        self.view.insertSubview(game, aboveSubview: self.blurredView)
+        self.sweepGame = game
+        self.duckButton.isHidden = true
+        self.updateLayout(size: size, bottomInset: bottomInset, transition: .immediate)
+        let center = game.begin(at: originalCenter)
+        let reducedMotion = UIAccessibility.isReduceMotionEnabled
+        let duration: Double = reducedMotion ? 0.16 : 0.38
+
+        if !reducedMotion {
+            let movement = CGPoint(x: 0, y: oldProgressY - self.progressBackgroundNode.frame.minY)
+            let layers = [
+                self.progressBackgroundNode.layer,
+                self.progressText.view?.layer,
+                self.descriptionText.view?.layer
+            ]
+            for layer in layers.compactMap({ $0 }) {
+                layer.animatePosition(from: movement, to: .zero, duration: duration, additive: true)
+            }
+        }
+
+        game.alpha = 0
+        game.isUserInteractionEnabled = false
+        UIView.animate(withDuration: duration, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState], animations: {
+            if !reducedMotion {
+                self.animationNode.view.transform = CGAffineTransform(translationX: center.x - originalCenter.x, y: center.y - originalCenter.y).scaledBy(x: 0.55, y: 0.55)
+            }
+            self.animationNode.alpha = 0
+            game.alpha = 1
+        }, completion: { [weak self, weak game] finished in
+            guard finished, let self, let game, self.sweepGame === game, !self.isFinishing else { return }
+            self.animationNode.visibility = false
+            game.isUserInteractionEnabled = true
+        })
+    }
+
+    private var isFinishing = false
+
+    func finishSweepGame() {
+        self.isFinishing = true
+        self.duckButton.isEnabled = false
+        self.sweepGame?.stop()
     }
     
     deinit {
@@ -3669,13 +3777,23 @@ private class StorageUsageClearProgressOverlayNode: ASDisplayNode {
         let displayAnimation = imageSize.height + spacing + textContentHeight <= availableHeight
         let contentHeight = textContentHeight + (displayAnimation ? imageSize.height + spacing : 0.0)
         let contentOriginY = floorToScreenPixels(max(topInset, min(size.height * 0.5 - 24.0 - contentHeight * 0.5, size.height - contentBottomInset - contentHeight)))
+        let progressTop = self.sweepGame != nil
+            ? max(0, size.height - contentBottomInset - textContentHeight - 8.0)
+            : contentOriginY + (displayAnimation ? imageSize.height + spacing : 0.0)
 
         let animationFrame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - imageSize.width) / 2.0), y: contentOriginY), size: imageSize)
-        self.animationNode.frame = animationFrame
-        self.animationNode.updateLayout(size: imageSize)
-        self.animationNode.alpha = displayAnimation ? 1.0 : 0.0
+        if let sweepGame = self.sweepGame {
+            sweepGame.frame = CGRect(origin: .zero, size: size)
+            sweepGame.update(progressTop: progressTop)
+        } else {
+            self.animationNode.frame = animationFrame
+            self.animationNode.updateLayout(size: imageSize)
+            self.animationNode.alpha = displayAnimation ? 1.0 : 0.0
+            self.duckButton.frame = animationFrame.insetBy(dx: 19, dy: 9)
+            self.duckButton.isHidden = !displayAnimation
+        }
 
-        let progressTextFrame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - progressTextSize.width) / 2.0), y: contentOriginY + (displayAnimation ? imageSize.height + spacing : 0.0)), size: progressTextSize)
+        let progressTextFrame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - progressTextSize.width) / 2.0), y: progressTop), size: progressTextSize)
         if let progressTextView = self.progressText.view {
             if progressTextView.superview == nil {
                 self.view.addSubview(progressTextView)
@@ -3685,8 +3803,8 @@ private class StorageUsageClearProgressOverlayNode: ASDisplayNode {
 
         let progressFrame = CGRect(x: inset, y: progressTextFrame.maxY + spacing, width: contentWidth, height: progressHeight)
         self.progressBackgroundNode.frame = progressFrame
-        let progressForegroundFrame = CGRect(origin: progressFrame.origin, size: CGSize(width: floorToScreenPixels(progressFrame.width * CGFloat(self.progress)), height: progressHeight))
-        if !self.progressForegroundNode.frame.origin.x.isZero {
+        let progressForegroundFrame = CGRect(origin: .zero, size: CGSize(width: floorToScreenPixels(progressFrame.width * CGFloat(self.progress)), height: progressHeight))
+        if self.progressForegroundNode.bounds.height > 0 {
             transition.updateFrame(node: self.progressForegroundNode, frame: progressForegroundFrame, beginWithCurrentState: true)
         } else {
             self.progressForegroundNode.frame = progressForegroundFrame
